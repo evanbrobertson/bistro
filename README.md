@@ -28,6 +28,10 @@ Herdr must be installed. Run:
 bistro
 ```
 
+- Click an agent to jump to it in Herdr.
+- Right-click an agent for a menu. Choose **Pin** to keep it at the top.
+- Bistro updates when Herdr says something changed. It does not poll.
+
 ## Develop
 
 You need [Rust](https://rustup.rs).
