@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write, stdout};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -20,7 +20,7 @@ use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 use ratatui::{DefaultTerminal, Frame};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const POLL: Duration = Duration::from_secs(2);
 const CARD_LINES: u16 = 3;
@@ -584,6 +584,79 @@ fn scroll(app: &mut App, delta: i32) {
     p.scroll = (p.scroll as i32 + delta).clamp(0, p.max_scroll() as i32) as u16;
 }
 
+/// What survives a restart for one panel: its dragged height and its pins.
+#[derive(Serialize, Deserialize, Default, PartialEq, Clone)]
+struct PanelState {
+    #[serde(default)]
+    height: Option<u16>,
+    #[serde(default)]
+    pinned: Vec<String>,
+}
+
+type SavedState = BTreeMap<String, PanelState>;
+
+fn state_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("bistro/state.json"))
+}
+
+fn load_state() -> SavedState {
+    state_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_state(state: &SavedState) {
+    let Some(path) = state_path() else { return };
+    let Some(dir) = path.parent() else { return };
+    // Best effort: losing a layout is not worth interrupting the display.
+    let _ = std::fs::create_dir_all(dir);
+    let tmp = path.with_extension("json.tmp");
+    if let Ok(json) = serde_json::to_string_pretty(state)
+        && std::fs::write(&tmp, json).is_ok()
+    {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+fn capture_state(panels: &[Panel]) -> SavedState {
+    panels
+        .iter()
+        .map(|p| {
+            let mut pinned: Vec<String> = p.pinned.iter().cloned().collect();
+            pinned.sort();
+            (
+                p.label.clone(),
+                PanelState {
+                    height: p.height,
+                    pinned,
+                },
+            )
+        })
+        .collect()
+}
+
+fn restore_state(panels: &mut [Panel], saved: &SavedState) {
+    for p in panels {
+        if let Some(st) = saved.get(&p.label) {
+            p.height = st.height;
+            p.pinned = st.pinned.iter().cloned().collect();
+        }
+    }
+}
+
+/// Write the state to disk if it changed since the last write.
+fn sync_state(app: &App, saved: &mut SavedState) {
+    let now = capture_state(&app.panels);
+    if now != *saved {
+        save_state(&now);
+        *saved = now;
+    }
+}
+
 fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     let mut app = App {
@@ -598,10 +671,13 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         spawn_poller(m.clone(), Some(m.clone()), tx.clone());
         app.panels.push(Panel::new(&m, Some(&m)));
     }
+    let mut saved = load_state();
+    restore_state(&mut app.panels, &saved);
 
     let mut last_draw = Instant::now() - Duration::from_secs(1);
     loop {
         let mut dirty = last_draw.elapsed() > Duration::from_secs(1);
+        sync_state(&app, &mut saved);
         while let Ok(reply) = rx.try_recv() {
             dirty = true;
             match reply {
@@ -624,8 +700,12 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
             match event::read()? {
                 Event::Key(k) => match k.code {
                     KeyCode::Esc => app.menu = None,
-                    KeyCode::Char('q') => return Ok(()),
+                    KeyCode::Char('q') => {
+                        sync_state(&app, &mut saved);
+                        return Ok(());
+                    }
                     KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                        sync_state(&app, &mut saved);
                         return Ok(());
                     }
                     KeyCode::Char('r') => app.panels.iter_mut().for_each(|p| p.height = None),
@@ -698,6 +778,22 @@ mod tests {
             terminal_title_stripped: String::new(),
         };
         (a, "ws".into())
+    }
+
+    #[test]
+    fn state_round_trips_through_json() {
+        let mut p = Panel::new("local", None);
+        p.height = Some(12);
+        p.pinned.insert("w1:p2".into());
+        let json = serde_json::to_string(&capture_state(&[p])).unwrap();
+        let saved: SavedState = serde_json::from_str(&json).unwrap();
+
+        let mut fresh = vec![Panel::new("local", None), Panel::new("other", None)];
+        restore_state(&mut fresh, &saved);
+        assert_eq!(fresh[0].height, Some(12));
+        assert!(fresh[0].pinned.contains("w1:p2"));
+        assert_eq!(fresh[1].height, None);
+        assert!(fresh[1].pinned.is_empty());
     }
 
     #[test]

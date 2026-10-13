@@ -31,6 +31,7 @@ bistro
 - Click an agent to jump to it in Herdr.
 - Right-click an agent for a menu. Choose **Pin** to keep it at the top.
 - Bistro updates when Herdr says something changed. It does not poll.
+- Bistro remembers your pins and panel sizes in `~/.config/bistro/state.json`.
 
 ## Develop
 
