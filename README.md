@@ -4,6 +4,8 @@ This is Bistro.
 
 Bistro shows your [Herdr](https://herdr.dev) agents in one tall list. It is made for vertical monitors. It looks like the menu board outside a bistro.
 
+![Bistro with three hosts](docs/screenshots/bistro-3-hosts.png)
+
 ## Install
 
 ```sh
@@ -42,6 +44,13 @@ cargo run              # run Bistro
 cargo fmt --all        # format
 cargo clippy --all-targets -- -D warnings
 cargo test
+```
+
+The screenshots in `docs/screenshots` use made-up data. To make them again:
+
+```sh
+cargo test screenshots -- --ignored
+for n in 1 2 3; do rsvg-convert -z 1 docs/screenshots/bistro-$n-hosts.svg -o docs/screenshots/bistro-$n-hosts.png; done
 ```
 
 Rules for changes:
