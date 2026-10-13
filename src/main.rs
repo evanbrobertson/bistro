@@ -1,5 +1,7 @@
-use std::collections::HashMap;
-use std::io::stdout;
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader, Write, stdout};
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
@@ -15,7 +17,7 @@ use ratatui::layout::{Constraint, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 use ratatui::{DefaultTerminal, Frame};
 use serde::Deserialize;
@@ -24,6 +26,11 @@ const POLL: Duration = Duration::from_secs(2);
 const CARD_LINES: u16 = 3;
 const MIN_PANEL: u16 = 3;
 const WHEEL_STEP: u16 = 3;
+/// Safety net for the event watcher: refresh this often even if Herdr stays quiet
+/// (terminal titles and working directories change without an event).
+const HEARTBEAT: Duration = Duration::from_secs(30);
+/// Events arrive in bursts; wait this long for the burst to end before refreshing.
+const SETTLE: Duration = Duration::from_millis(100);
 
 #[derive(Deserialize, Clone)]
 struct Agent {
@@ -61,6 +68,8 @@ struct Panel {
     /// `--machine` argument; `None` for the local session.
     machine: Option<String>,
     agents: Vec<(Agent, String)>,
+    /// Pane IDs pinned to the top of this panel.
+    pinned: HashSet<String>,
     error: Option<String>,
     scroll: u16,
     /// Explicit height set by dragging; `None` sizes to content.
@@ -74,6 +83,7 @@ impl Panel {
             label: label.into(),
             machine: machine.map(String::from),
             agents: vec![],
+            pinned: HashSet::new(),
             error: None,
             scroll: 0,
             height: None,
@@ -91,7 +101,7 @@ impl Panel {
 
     fn sorted(&self) -> Vec<&(Agent, String)> {
         let mut v: Vec<_> = self.agents.iter().collect();
-        v.sort_by_key(|(a, _)| rank(&a.agent_status));
+        v.sort_by_key(|(a, _)| (!self.pinned.contains(&a.pane_id), rank(&a.agent_status)));
         v
     }
 
@@ -110,6 +120,24 @@ struct App {
     hover: Option<usize>,
     drag: Option<usize>,
     msg: Option<(String, Instant)>,
+    menu: Option<Menu>,
+}
+
+/// Right-click menu for one agent card.
+struct Menu {
+    panel: usize,
+    pane_id: String,
+    pinned: bool,
+    /// Top-left corner, clamped to the screen when drawn.
+    x: u16,
+    y: u16,
+    rect: Rect,
+}
+
+impl Menu {
+    fn items(&self) -> [&'static str; 1] {
+        [if self.pinned { "Unpin" } else { "Pin" }]
+    }
 }
 
 fn herdr(machine: Option<&str>, args: &[&str]) -> Result<String> {
@@ -167,6 +195,102 @@ fn spawn_poller(label: String, machine: Option<String>, tx: mpsc::Sender<Reply>)
                 return;
             }
             thread::sleep(POLL);
+        }
+    });
+}
+
+/// Where Herdr's socket API lives, the same way the `herdr` CLI finds it.
+fn socket_path() -> Option<PathBuf> {
+    std::env::var_os("HERDR_SOCKET_PATH")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/herdr/herdr.sock"))
+        })
+}
+
+/// Open the event stream for the local session. `None` means the socket is
+/// unavailable and the caller should fall back to polling.
+fn subscribe(panes: &[String]) -> Option<BufReader<UnixStream>> {
+    let mut stream = UnixStream::connect(socket_path()?).ok()?;
+    let mut subscriptions: Vec<serde_json::Value> = [
+        "pane.created",
+        "pane.closed",
+        "pane.exited",
+        "pane.agent_detected",
+        "workspace.created",
+        "workspace.closed",
+        "workspace.renamed",
+    ]
+    .iter()
+    .map(|t| serde_json::json!({ "type": t }))
+    .collect();
+    subscriptions.extend(
+        panes
+            .iter()
+            .map(|p| serde_json::json!({ "type": "pane.agent_status_changed", "pane_id": p })),
+    );
+    let request = serde_json::json!({
+        "id": "bistro",
+        "method": "events.subscribe",
+        "params": { "subscriptions": subscriptions },
+    });
+    writeln!(stream, "{request}").ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    let mut reader = BufReader::new(stream);
+    let mut ack = String::new();
+    reader.read_line(&mut ack).ok()?;
+    ack.contains("subscription_started").then_some(reader)
+}
+
+/// Block until Herdr reports a change, the stream closes, or the heartbeat expires.
+fn wait_for_event(reader: &mut BufReader<UnixStream>) {
+    let mut line = String::new();
+    let _ = reader.get_ref().set_read_timeout(Some(HEARTBEAT));
+    if !matches!(reader.read_line(&mut line), Ok(n) if n > 0) {
+        return;
+    }
+    // Let the rest of a burst arrive so it costs one refresh, not many.
+    let _ = reader.get_ref().set_read_timeout(Some(SETTLE));
+    while matches!(reader.read_line(&mut line), Ok(n) if n > 0) {}
+}
+
+/// Refresh the local session when Herdr says something changed, instead of on a timer.
+///
+/// Subscribes before fetching so no change can slip between the two. Agent
+/// status events are per pane, so whenever the set of agent panes changes the
+/// subscription is rebuilt. Falls back to polling when the socket is unavailable.
+fn spawn_watcher(label: String, tx: mpsc::Sender<Reply>) {
+    thread::spawn(move || {
+        let mut panes: Vec<String> = vec![];
+        loop {
+            let stream = subscribe(&panes);
+            let result = fetch(None);
+            let current = match &result {
+                Ok(agents) => {
+                    let mut ids: Vec<String> =
+                        agents.iter().map(|(a, _)| a.pane_id.clone()).collect();
+                    ids.sort();
+                    Some(ids)
+                }
+                Err(_) => None,
+            };
+            let reply = match result {
+                Ok(a) => Reply::Ok(label.clone(), a),
+                Err(e) => Reply::Err(label.clone(), e.to_string()),
+            };
+            if tx.send(reply).is_err() {
+                return;
+            }
+            if let Some(ids) = current
+                && ids != panes
+            {
+                panes = ids;
+                continue;
+            }
+            match stream {
+                Some(mut reader) => wait_for_event(&mut reader),
+                None => thread::sleep(POLL),
+            }
         }
     });
 }
@@ -283,6 +407,14 @@ fn draw(f: &mut Frame, app: &mut App) {
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!("  {ws}")),
+                Span::styled(
+                    if p.pinned.contains(&a.pane_id) {
+                        "  ★"
+                    } else {
+                        ""
+                    },
+                    Style::default().fg(Color::Yellow),
+                ),
             ]));
             let detail = if a.terminal_title_stripped.is_empty() {
                 short_cwd(&a.cwd)
@@ -316,6 +448,37 @@ fn draw(f: &mut Frame, app: &mut App) {
         }
     }
 
+    if let Some(menu) = &mut app.menu {
+        let items = menu.items();
+        let width = items.iter().map(|i| i.len()).max().unwrap_or(0) as u16 + 4;
+        let height = items.len() as u16 + 2;
+        let area = f.area();
+        menu.rect = Rect::new(
+            menu.x.min(area.right().saturating_sub(width)),
+            menu.y.min(area.bottom().saturating_sub(height)),
+            width.min(area.width),
+            height.min(area.height),
+        );
+        let lines: Vec<Line> = items
+            .iter()
+            .map(|i| {
+                Line::styled(
+                    format!(" {i} "),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )
+            })
+            .collect();
+        f.render_widget(Clear, menu.rect);
+        f.render_widget(
+            Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            ),
+            menu.rect,
+        );
+    }
+
     if app
         .msg
         .as_ref()
@@ -326,7 +489,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     let footer_line = match &app.msg {
         Some((m, _)) => Line::styled(m.clone(), Style::default().fg(Color::Cyan)),
         None => Line::styled(
-            "click focus · wheel/jk scroll · drag border resize · r reset · q quit",
+            "click focus · right-click menu · wheel/jk scroll · drag border resize · r reset · q quit",
             Style::default().fg(Color::DarkGray),
         ),
     };
@@ -365,20 +528,53 @@ fn resize(app: &mut App, i: usize, y: u16) {
     app.panels[i].height = Some((y.saturating_sub(top) + 1).clamp(MIN_PANEL, max));
 }
 
-fn click(app: &App, x: u16, y: u16, tx: &mpsc::Sender<Reply>) {
-    let Some(i) = panel_at(app, x, y) else { return };
+/// The agent card under a screen position, as (panel index, agent).
+fn agent_at(app: &App, x: u16, y: u16) -> Option<(usize, Agent)> {
+    let i = panel_at(app, x, y)?;
     let p = &app.panels[i];
     let inner = p.inner();
     if y < inner.y || y >= inner.bottom() {
-        return;
+        return None;
     }
     let line = y - inner.y + p.scroll;
     if line < p.header_lines() {
-        return;
+        return None;
     }
     let idx = ((line - p.header_lines()) / CARD_LINES) as usize;
-    if let Some((agent, _)) = p.sorted().get(idx) {
-        spawn_focus(p.machine.clone(), p.label.clone(), agent, tx.clone());
+    p.sorted().get(idx).map(|(agent, _)| (i, agent.clone()))
+}
+
+fn click(app: &App, x: u16, y: u16, tx: &mpsc::Sender<Reply>) {
+    if let Some((i, agent)) = agent_at(app, x, y) {
+        let p = &app.panels[i];
+        spawn_focus(p.machine.clone(), p.label.clone(), &agent, tx.clone());
+    }
+}
+
+fn open_menu(app: &mut App, x: u16, y: u16) {
+    app.menu = agent_at(app, x, y).map(|(panel, agent)| Menu {
+        panel,
+        pinned: app.panels[panel].pinned.contains(&agent.pane_id),
+        pane_id: agent.pane_id,
+        x,
+        y,
+        rect: Rect::default(),
+    });
+}
+
+/// Handle a left click while a menu is open. Any click closes the menu; a click
+/// on an item also runs it.
+fn click_menu(app: &mut App, x: u16, y: u16) {
+    let Some(menu) = app.menu.take() else { return };
+    let r = menu.rect;
+    let inside = x > r.x && x < r.right() - 1 && y > r.y && y < r.bottom() - 1;
+    if !inside {
+        return;
+    }
+    // "Pin" / "Unpin" is the first (and so far only) item.
+    let pinned = &mut app.panels[menu.panel].pinned;
+    if !pinned.remove(&menu.pane_id) {
+        pinned.insert(menu.pane_id);
     }
 }
 
@@ -395,8 +591,9 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         hover: None,
         drag: None,
         msg: None,
+        menu: None,
     };
-    spawn_poller("local".into(), None, tx.clone());
+    spawn_watcher("local".into(), tx.clone());
     for m in remote_machines() {
         spawn_poller(m.clone(), Some(m.clone()), tx.clone());
         app.panels.push(Panel::new(&m, Some(&m)));
@@ -426,6 +623,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
             dirty = true;
             match event::read()? {
                 Event::Key(k) => match k.code {
+                    KeyCode::Esc => app.menu = None,
                     KeyCode::Char('q') => return Ok(()),
                     KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                         return Ok(());
@@ -444,6 +642,12 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
                     match m.kind {
                         MouseEventKind::ScrollDown => scroll(&mut app, WHEEL_STEP as i32),
                         MouseEventKind::ScrollUp => scroll(&mut app, -(WHEEL_STEP as i32)),
+                        MouseEventKind::Down(MouseButton::Left) if app.menu.is_some() => {
+                            click_menu(&mut app, m.column, m.row);
+                        }
+                        MouseEventKind::Down(MouseButton::Right) => {
+                            open_menu(&mut app, m.column, m.row);
+                        }
                         MouseEventKind::Down(MouseButton::Left) => {
                             match border_at(&app, m.column, m.row) {
                                 Some(i) => app.drag = Some(i),
@@ -476,4 +680,78 @@ fn main() -> Result<()> {
     let _ = execute!(stdout(), DisableMouseCapture);
     ratatui::restore();
     res
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::net::UnixListener;
+
+    use super::*;
+
+    fn agent(pane: &str, status: &str) -> (Agent, String) {
+        let a = Agent {
+            agent: "claude".into(),
+            agent_status: status.into(),
+            cwd: "/tmp".into(),
+            pane_id: pane.into(),
+            workspace_id: "w1".into(),
+            terminal_title_stripped: String::new(),
+        };
+        (a, "ws".into())
+    }
+
+    #[test]
+    fn pinned_agents_sort_above_everything() {
+        let mut p = Panel::new("local", None);
+        p.agents = vec![
+            agent("p1", "blocked"),
+            agent("p2", "idle"),
+            agent("p3", "working"),
+        ];
+        let order = |p: &Panel| -> Vec<String> {
+            p.sorted().iter().map(|(a, _)| a.pane_id.clone()).collect()
+        };
+        assert_eq!(order(&p), ["p1", "p3", "p2"]);
+        p.pinned.insert("p2".into());
+        assert_eq!(order(&p), ["p2", "p1", "p3"]);
+    }
+
+    #[test]
+    fn watcher_wakes_on_event_and_subscribes_per_pane() {
+        let dir = std::env::temp_dir().join(format!("bistro-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("herdr.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        // SAFETY: this is the only test that touches the environment.
+        unsafe { std::env::set_var("HERDR_SOCKET_PATH", &path) };
+
+        let server = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(conn.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            writeln!(
+                conn,
+                r#"{{"id":"bistro","result":{{"type":"subscription_started"}}}}"#
+            )
+            .unwrap();
+            thread::sleep(Duration::from_millis(200));
+            writeln!(conn, r#"{{"event":"pane.agent_status_changed"}}"#).unwrap();
+            request
+        });
+
+        let mut reader = subscribe(&["w1:p1".to_string()]).expect("subscribed");
+        let started = Instant::now();
+        wait_for_event(&mut reader);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "woke on the event"
+        );
+
+        let request = server.join().unwrap();
+        assert!(request.contains("events.subscribe"));
+        assert!(request.contains(r#""pane_id":"w1:p1""#));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
