@@ -17,6 +17,7 @@ fi
 
 bump=""
 while IFS= read -r -d '' msg; do
+  msg="${msg#"${msg%%[!$'\n']*}"}"
   subject="${msg%%$'\n'*}"
   if [[ "${subject}" =~ ^[a-z]+(\([^\)]+\))?!: ]] || grep -q '^BREAKING[ -]CHANGE:' <<<"${msg}"; then
     bump="breaking"
