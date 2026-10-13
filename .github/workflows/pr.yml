@@ -1,0 +1,57 @@
+# Quality checks for pull requests into main.
+# These are the checks branch protection requires.
+name: PR Checks
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, edited, synchronize, reopened]
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  title:
+    name: PR title
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the title is a Conventional Commit
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          # The PR title becomes the squash commit on main, so it sets the version.
+          re='^(feat|fix|docs|style|refactor|perf|test|chore|ci|revert)(\([^)]+\))?!?: .+'
+          if ! [[ "${TITLE}" =~ ${re} ]]; then
+            echo "Bad title: ${TITLE}" >&2
+            echo "Use: type(scope): description  (types: feat fix docs style refactor perf test chore ci revert)" >&2
+            exit 1
+          fi
+
+  quality:
+    name: Quality (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+        if: always()
+      - run: cargo test --all-features --locked
+        if: always()
+
+  installer:
+    name: Installer (shellcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck install.sh scripts/ci/*.sh
