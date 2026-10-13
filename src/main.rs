@@ -763,6 +763,9 @@ fn main() -> Result<()> {
 }
 
 #[cfg(test)]
+mod screenshots;
+
+#[cfg(test)]
 mod tests {
     use std::os::unix::net::UnixListener;
 
