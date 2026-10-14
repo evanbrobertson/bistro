@@ -707,7 +707,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         msg: None,
         menu: None,
     };
-    let has_orca = cli_available("orca");
+    let has_orca = orca::executable().is_some();
     if cli_available("herdr") || !has_orca {
         app.panels.push(Panel::new("local", None));
         spawn_watcher("local".into(), tx.clone());
@@ -855,7 +855,7 @@ fn list_agents() -> Result<()> {
             });
         }
     }
-    if cli_available("orca") {
+    if orca::executable().is_some() {
         let mut environments = vec![("orca:local".to_string(), None)];
         match orca::environments() {
             Ok(remotes) => environments.extend(
@@ -872,6 +872,11 @@ fn list_agents() -> Result<()> {
                 Ok(s) => serde_json::json!({"source":"orca", "panel":label, "environment":environment, "agents":s.agents, "warning":s.warning}),
                 Err(e) => serde_json::json!({"source":"orca", "panel":label, "environment":environment, "error":e.to_string()}),
             });
+        }
+    }
+    for panel in &mut panels {
+        if panel["source"] == "orca" {
+            panel["cli"] = serde_json::json!(orca::executable());
         }
     }
     println!("{}", serde_json::to_string_pretty(&panels)?);

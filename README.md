@@ -45,7 +45,15 @@ orca environment list --json
 
 Bistro queries the local runtime and each saved environment explicitly, independently of `ORCA_ENVIRONMENT` or pairing-code environment variables. SSH-managed terminals already reported by a runtime are included in that runtime's panel. If Orca reports hosts it did not cover, Bistro shows a coverage message. An offline server shows its own error while other panels continue updating.
 
-The Orca app launcher may be named `stably-orca` on Linux; Bistro uses the separate `orca` CLI shim, not the GUI launcher. Check `command -v orca` in the shell where you run Bistro.
+The Orca app launcher may be named `stably-orca` on Linux. Its CLI is normally `orca-ide` on Linux and `orca` on macOS. Bistro prefers `orca-ide` when available because Linux's GNOME screen reader is also named `orca`. Both executables are searched in `PATH`.
+
+To select the CLI explicitly (also useful for an AppImage or custom install):
+
+```sh
+BISTRO_ORCA_CLI=/path/to/orca-ide bistro
+```
+
+Use the IDE's CLI executable rather than its GUI launcher. `bistro --list` includes the selected CLI path in each Orca result.
 
 To diagnose discovery without starting the terminal UI:
 
