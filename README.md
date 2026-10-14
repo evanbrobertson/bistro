@@ -2,7 +2,7 @@
 
 This is Bistro.
 
-Bistro shows your [Herdr](https://herdr.dev) agents in one tall list. It is made for vertical monitors. It looks like the menu board outside a bistro.
+Bistro shows your [Herdr](https://herdr.dev) and Orca agents in one tall list. It is made for vertical monitors. It looks like the menu board outside a bistro.
 
 ![Bistro with three hosts](docs/screenshots/bistro-3-hosts.png)
 
@@ -24,15 +24,16 @@ To install to a different folder, set `BISTRO_INSTALL_DIR`.
 
 ## Use
 
-Herdr must be installed. Run:
+Install Herdr, Orca, or both, and put their CLIs in your `PATH`. Run:
 
 ```sh
 bistro
 ```
 
-- Click an agent to jump to it in Herdr.
+- Click an agent to jump to it in Herdr or Orca.
 - Right-click an agent for a menu. Choose **Pin** to keep it at the top.
-- Bistro updates when Herdr says something changed. It does not poll.
+- Bistro updates when local Herdr says something changed. Remote Herdr machines and Orca refresh every two seconds.
+- Orca appears in its own `orca:local` panel when its CLI is installed. Orca agents without a status report appear as idle; waiting agents appear as blocked. Orca remote environments are not yet included.
 - Bistro remembers your pins and panel sizes in `~/.config/bistro/state.json`.
 
 ## Develop

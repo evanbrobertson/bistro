@@ -1,6 +1,6 @@
 [package]
 name = "bistro"
-description = "A vertical, stacked view of your Herdr agents"
+description = "A vertical, stacked view of your Herdr and Orca agents"
 license = "MIT"
 repository = "https://github.com/evanbrobertson/bistro"
 publish = false

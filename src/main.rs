@@ -32,6 +32,15 @@ const HEARTBEAT: Duration = Duration::from_secs(30);
 /// Events arrive in bursts; wait this long for the burst to end before refreshing.
 const SETTLE: Duration = Duration::from_millis(100);
 
+mod orca;
+
+#[derive(Clone, Copy, Default, PartialEq)]
+enum Source {
+    #[default]
+    Herdr,
+    Orca,
+}
+
 #[derive(Deserialize, Clone)]
 struct Agent {
     agent: String,
@@ -65,6 +74,7 @@ enum Reply {
 
 struct Panel {
     label: String,
+    source: Source,
     /// `--machine` argument; `None` for the local session.
     machine: Option<String>,
     agents: Vec<(Agent, String)>,
@@ -81,6 +91,7 @@ impl Panel {
     fn new(label: &str, machine: Option<&str>) -> Self {
         Self {
             label: label.into(),
+            source: Source::Herdr,
             machine: machine.map(String::from),
             agents: vec![],
             pinned: HashSet::new(),
@@ -184,10 +195,14 @@ fn remote_machines() -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn spawn_poller(label: String, machine: Option<String>, tx: mpsc::Sender<Reply>) {
+fn spawn_poller(source: Source, label: String, machine: Option<String>, tx: mpsc::Sender<Reply>) {
     thread::spawn(move || {
         loop {
-            let reply = match fetch(machine.as_deref()) {
+            let result = match source {
+                Source::Herdr => fetch(machine.as_deref()),
+                Source::Orca => orca::fetch(),
+            };
+            let reply = match result {
                 Ok(a) => Reply::Ok(label.clone(), a),
                 Err(e) => Reply::Err(label.clone(), e.to_string()),
             };
@@ -295,11 +310,24 @@ fn spawn_watcher(label: String, tx: mpsc::Sender<Reply>) {
     });
 }
 
-fn spawn_focus(machine: Option<String>, label: String, agent: &Agent, tx: mpsc::Sender<Reply>) {
+fn focus_command(source: Source, machine: Option<&str>, pane: &str) -> Result<()> {
+    match source {
+        Source::Herdr => herdr(machine, &["agent", "focus", pane]).map(|_| ()),
+        Source::Orca => orca::focus(pane),
+    }
+}
+
+fn spawn_focus(
+    source: Source,
+    machine: Option<String>,
+    label: String,
+    agent: &Agent,
+    tx: mpsc::Sender<Reply>,
+) {
     let pane = agent.pane_id.clone();
     let kind = agent.agent.clone();
     thread::spawn(move || {
-        let msg = match herdr(machine.as_deref(), &["agent", "focus", &pane]) {
+        let msg = match focus_command(source, machine.as_deref(), &pane) {
             Ok(_) => format!("focused {kind} {pane} on {label}"),
             Err(e) => format!("focus failed: {e}"),
         };
@@ -547,7 +575,13 @@ fn agent_at(app: &App, x: u16, y: u16) -> Option<(usize, Agent)> {
 fn click(app: &App, x: u16, y: u16, tx: &mpsc::Sender<Reply>) {
     if let Some((i, agent)) = agent_at(app, x, y) {
         let p = &app.panels[i];
-        spawn_focus(p.machine.clone(), p.label.clone(), &agent, tx.clone());
+        spawn_focus(
+            p.source,
+            p.machine.clone(),
+            p.label.clone(),
+            &agent,
+            tx.clone(),
+        );
     }
 }
 
@@ -660,16 +694,26 @@ fn sync_state(app: &App, saved: &mut SavedState) {
 fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     let mut app = App {
-        panels: vec![Panel::new("local", None)],
+        panels: vec![],
         hover: None,
         drag: None,
         msg: None,
         menu: None,
     };
-    spawn_watcher("local".into(), tx.clone());
-    for m in remote_machines() {
-        spawn_poller(m.clone(), Some(m.clone()), tx.clone());
-        app.panels.push(Panel::new(&m, Some(&m)));
+    let has_orca = cli_available("orca");
+    if cli_available("herdr") || !has_orca {
+        app.panels.push(Panel::new("local", None));
+        spawn_watcher("local".into(), tx.clone());
+        for m in remote_machines() {
+            spawn_poller(Source::Herdr, m.clone(), Some(m.clone()), tx.clone());
+            app.panels.push(Panel::new(&m, Some(&m)));
+        }
+    }
+    if has_orca {
+        let mut panel = Panel::new("orca:local", None);
+        panel.source = Source::Orca;
+        spawn_poller(Source::Orca, panel.label.clone(), None, tx.clone());
+        app.panels.push(panel);
     }
     let mut saved = load_state();
     restore_state(&mut app.panels, &saved);
@@ -753,6 +797,16 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     }
 }
 
+fn cli_available(name: &str) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            std::fs::metadata(dir.join(name))
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+    })
+}
+
 fn main() -> Result<()> {
     let mut terminal = ratatui::init();
     execute!(stdout(), EnableMouseCapture)?;
@@ -781,6 +835,47 @@ mod tests {
             terminal_title_stripped: String::new(),
         };
         (a, "ws".into())
+    }
+
+    #[test]
+    fn mixed_panels_preserve_pins_and_click_the_correct_agent() {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut herdr = Panel::new("local", None);
+        herdr.agents = vec![agent("term_one", "working")];
+        herdr.pinned.insert("term_one".into());
+        let mut orca = Panel::new("orca:local", None);
+        orca.source = Source::Orca;
+        orca.agents = vec![
+            agent("orca:term_one", "idle"),
+            agent("orca:term_two", "blocked"),
+        ];
+        orca.pinned.insert("orca:term_one".into());
+        let mut app = App {
+            panels: vec![herdr, orca],
+            hover: None,
+            drag: None,
+            msg: None,
+            menu: None,
+        };
+        let saved = capture_state(&app.panels);
+        let mut fresh = vec![Panel::new("local", None), Panel::new("orca:local", None)];
+        restore_state(&mut fresh, &saved);
+        assert!(fresh[0].pinned.contains("term_one"));
+        assert!(fresh[1].pinned.contains("orca:term_one"));
+        assert!(!fresh[1].pinned.contains("term_one"));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let inner = app.panels[1].inner();
+        let (panel, a) = agent_at(&app, inner.x, inner.y).unwrap();
+        assert_eq!(panel, 1);
+        assert!(app.panels[panel].source == Source::Orca);
+        assert_eq!(a.pane_id, "orca:term_one");
+        open_menu(&mut app, inner.x, inner.y);
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let menu = app.menu.as_ref().unwrap().rect;
+        click_menu(&mut app, menu.x + 1, menu.y + 1);
+        assert!(!app.panels[1].pinned.contains("orca:term_one"));
+        assert!(app.panels[0].pinned.contains("term_one"));
     }
 
     #[test]
