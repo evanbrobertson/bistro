@@ -34,7 +34,8 @@ bistro
 - Right-click an agent for a menu. Choose **Pin** to keep it at the top.
 - Bistro updates when local Herdr says something changed. Remote Herdr machines and Orca refresh every two seconds.
 - Orca appears in its own `orca:local` panel when its CLI is installed. Orca agents without a status report appear as idle; waiting agents appear as blocked.
-- Each saved Orca environment appears in an `orca:<name>` panel. Bistro discovers new environments every 30 seconds and refreshes each panel every two seconds. Clicks focus terminals through that environment. Pins stay with the environment ID even if its name changes.
+- Each saved Orca environment appears in an `orca:<name>` panel. Bistro discovers new environments every 30 seconds and refreshes each panel every two seconds. Pins stay with the environment ID even if its name changes.
+- Local Orca clicks focus its IDE. Remote Orca clicks select the terminal on the server: the current Orca CLI requests host navigation and cannot focus your desktop client for a remote server. Bistro reports this limitation in its footer.
 
 To include a remote Orca server, save it on the machine running Bistro using Orca's **Settings > Managed servers** or its CLI:
 
@@ -43,7 +44,7 @@ orca environment add --name my-server --pairing-code '<pairing code from the ser
 orca environment list --json
 ```
 
-Bistro queries the local runtime and each saved environment explicitly, independently of `ORCA_ENVIRONMENT` or pairing-code environment variables. SSH-managed terminals already reported by a runtime are included in that runtime's panel. If Orca reports hosts it did not cover, Bistro shows a coverage message. An offline server shows its own error while other panels continue updating.
+Bistro queries the local runtime and each saved environment explicitly, independently of `ORCA_ENVIRONMENT` or pairing-code environment variables. SSH-managed terminals already reported by a runtime are included in that runtime's panel. Coverage warnings omit paired servers that have separate panels; unpaired servers and uncovered SSH hosts still produce a warning. An offline paired server shows its own error while other panels continue updating.
 
 The Orca app launcher may be named `stably-orca` on Linux. Its CLI is normally `orca-ide` on Linux and `orca` on macOS. Bistro prefers `orca-ide` when available because Linux's GNOME screen reader is also named `orca`. Both executables are searched in `PATH`.
 
