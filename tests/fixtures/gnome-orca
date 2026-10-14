@@ -1,0 +1,3 @@
+#!/bin/sh
+printf '%s\n' '(orca:2635584): dbind-WARNING **: QueryPointer failed: GDBus.Error:org.freedesktop.DBus.Error.UnknownInterface: No such interface org.freedesktop.a11y.PointerLocator' >&2
+exit 1

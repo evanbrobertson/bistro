@@ -1,6 +1,24 @@
 //! Orca's public CLI is request/response, so its panel refreshes by polling.
-use super::{Agent, Command, HashMap, Result};
+use super::{Agent, Command, HashMap, PathBuf, Result};
 use serde::Deserialize;
+
+pub(super) fn executable() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("BISTRO_ORCA_CLI") {
+        return Some(path.into());
+    }
+    let path = std::env::var_os("PATH")?;
+    // Linux's GNOME screen reader also owns the name `orca`. The IDE's
+    // installer deliberately uses `orca-ide` to avoid that collision.
+    ["orca-ide", "orca"].into_iter().find_map(|name| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(name))
+            .find(|path| {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::metadata(path)
+                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            })
+    })
+}
 
 fn response(raw: &str) -> Result<serde_json::Value> {
     let value: serde_json::Value = serde_json::from_str(raw)?;
@@ -18,7 +36,7 @@ fn response(raw: &str) -> Result<serde_json::Value> {
 }
 
 fn command_line(environment: Option<&str>, args: &[&str]) -> Command {
-    let mut cmd = Command::new("orca");
+    let mut cmd = Command::new(executable().unwrap_or_else(|| "orca-ide".into()));
     // Panel identity must determine routing, never inherited shell overrides.
     cmd.env_remove("ORCA_ENVIRONMENT")
         .env_remove("ORCA_PAIRING_CODE")
@@ -32,11 +50,20 @@ fn command_line(environment: Option<&str>, args: &[&str]) -> Command {
 }
 
 fn command(environment: Option<&str>, args: &[&str]) -> Result<serde_json::Value> {
-    let out = command_line(environment, args).output()?;
+    let mut cmd = command_line(environment, args);
+    let program = cmd.get_program().to_string_lossy().into_owned();
+    let out = cmd.output().map_err(|e| {
+        anyhow::anyhow!("Orca CLI {program}: {e}. Set BISTRO_ORCA_CLI to the IDE CLI executable.")
+    })?;
     if !out.status.success() {
-        anyhow::bail!("Orca: {}", String::from_utf8_lossy(&out.stderr).trim());
+        anyhow::bail!(
+            "Orca CLI {program} exited {}: {}. If this is GNOME Orca, set BISTRO_ORCA_CLI to orca-ide.",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     response(&String::from_utf8_lossy(&out.stdout))
+        .map_err(|e| anyhow::anyhow!("Orca CLI {program}: {e}"))
 }
 
 #[derive(Deserialize)]
