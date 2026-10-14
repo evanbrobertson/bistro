@@ -168,12 +168,23 @@ pub(super) struct Snapshot {
     pub warning: Option<String>,
 }
 
-fn coverage_warning(results: &[&serde_json::Value]) -> Option<String> {
+fn coverage_warning(
+    results: &[&serde_json::Value],
+    environments: &[Environment],
+) -> Option<String> {
     let mut omitted = std::collections::BTreeSet::new();
     for result in results {
         if let Some(ids) = result["hostScope"]["omittedHostIds"].as_array() {
             for id in ids.iter().filter_map(|v| v.as_str()) {
-                omitted.insert(id.to_string());
+                // Paired runtimes are queried independently by Bistro. A runtime
+                // is not expected to census its peers, so their disclosure is
+                // not a coverage failure for the whole application.
+                let has_panel = id
+                    .strip_prefix("runtime:")
+                    .is_some_and(|id| environments.iter().any(|environment| environment.id == id));
+                if !has_panel {
+                    omitted.insert(id.to_string());
+                }
             }
         }
     }
@@ -188,7 +199,10 @@ fn coverage_warning(results: &[&serde_json::Value]) -> Option<String> {
 pub(super) fn fetch(environment: Option<&str>) -> Result<Snapshot> {
     let worktrees = command(environment, &["worktree", "ps", "--limit", "10000"])?;
     let terminals = command(environment, &["terminal", "list", "--limit", "10000"])?;
-    let warning = coverage_warning(&[&worktrees, &terminals]);
+    // A failed discovery must not hide gaps. Its own error is reported by the
+    // discovery worker and --list; preserve all omissions here in that case.
+    let known = environments().unwrap_or_default();
+    let warning = coverage_warning(&[&worktrees, &terminals], &known);
     Ok(Snapshot {
         agents: join(
             serde_json::from_value(terminals)?,
@@ -226,6 +240,26 @@ pub(super) fn environments() -> Result<Vec<Environment>> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn warnings_keep_unpaired_and_ssh_gaps_but_ignore_separate_panels() {
+        let known = [Environment {
+            id: "paired".into(),
+            name: "server".into(),
+        }];
+        let covered = json!({"hostScope":{"omittedHostIds":["runtime:paired"]}});
+        assert!(coverage_warning(&[&covered], &known).is_none());
+        assert!(
+            coverage_warning(&[&covered], &[])
+                .unwrap()
+                .contains("runtime:paired")
+        );
+        let missing = json!({"hostScope":{"omittedHostIds":["runtime:paired", "runtime:unpaired", "ssh:offline"]}});
+        let warning = coverage_warning(&[&missing], &known).unwrap();
+        assert!(warning.contains("runtime:unpaired"));
+        assert!(warning.contains("ssh:offline"));
+        assert!(!warning.contains("runtime:paired"));
+    }
 
     #[test]
     fn focus_routes_the_handle_to_the_selected_server() {

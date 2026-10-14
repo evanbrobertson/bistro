@@ -95,10 +95,8 @@ fn lists_local_and_remote_agents_and_reports_offline_servers() {
     assert_eq!(remote["environment"], "remote-id");
     assert_eq!(remote["agents"][0][0]["pane_id"], "orca:term_shared");
     assert!(
-        local["warning"]
-            .as_str()
-            .unwrap()
-            .contains("runtime:remote-id")
+        local["warning"].is_null(),
+        "paired server has its own panel: {local}"
     );
     assert!(
         offline["error"]

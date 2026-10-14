@@ -334,6 +334,11 @@ fn spawn_focus(
     let kind = agent.agent.clone();
     thread::spawn(move || {
         let msg = match focus_command(source, machine.as_deref(), &pane) {
+            Ok(_) if source == Source::Orca && machine.is_some() => {
+                format!(
+                    "selected {kind} on {label} server; Orca CLI cannot focus the desktop client"
+                )
+            }
             Ok(_) => format!("focused {kind} {pane} on {label}"),
             Err(e) => format!("focus failed: {e}"),
         };
