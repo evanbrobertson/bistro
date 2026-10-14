@@ -33,7 +33,27 @@ bistro
 - Click an agent to jump to it in Herdr or Orca.
 - Right-click an agent for a menu. Choose **Pin** to keep it at the top.
 - Bistro updates when local Herdr says something changed. Remote Herdr machines and Orca refresh every two seconds.
-- Orca appears in its own `orca:local` panel when its CLI is installed. Orca agents without a status report appear as idle; waiting agents appear as blocked. Orca remote environments are not yet included.
+- Orca appears in its own `orca:local` panel when its CLI is installed. Orca agents without a status report appear as idle; waiting agents appear as blocked.
+- Each saved Orca environment appears in an `orca:<name>` panel. Bistro discovers new environments every 30 seconds and refreshes each panel every two seconds. Clicks focus terminals through that environment. Pins stay with the environment ID even if its name changes.
+
+To include a remote Orca server, save it on the machine running Bistro using Orca's **Settings > Managed servers** or its CLI:
+
+```sh
+orca environment add --name my-server --pairing-code '<pairing code from the server>'
+orca environment list --json
+```
+
+Bistro queries the local runtime and each saved environment explicitly, independently of `ORCA_ENVIRONMENT` or pairing-code environment variables. SSH-managed terminals already reported by a runtime are included in that runtime's panel. If Orca reports hosts it did not cover, Bistro shows a coverage message. An offline server shows its own error while other panels continue updating.
+
+The Orca app launcher may be named `stably-orca` on Linux; Bistro uses the separate `orca` CLI shim, not the GUI launcher. Check `command -v orca` in the shell where you run Bistro.
+
+To diagnose discovery without starting the terminal UI:
+
+```sh
+bistro --list
+```
+
+This prints each source's agents, remote environment ID, errors, and coverage warnings as JSON.
 - Bistro remembers your pins and panel sizes in `~/.config/bistro/state.json`.
 
 ## Develop

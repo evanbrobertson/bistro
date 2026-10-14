@@ -17,8 +17,22 @@ fn response(raw: &str) -> Result<serde_json::Value> {
     Ok(result.clone())
 }
 
-fn command(args: &[&str]) -> Result<serde_json::Value> {
-    let out = Command::new("orca").args(args).arg("--json").output()?;
+fn command_line(environment: Option<&str>, args: &[&str]) -> Command {
+    let mut cmd = Command::new("orca");
+    // Panel identity must determine routing, never inherited shell overrides.
+    cmd.env_remove("ORCA_ENVIRONMENT")
+        .env_remove("ORCA_PAIRING_CODE")
+        .env_remove("ORCA_REMOTE_PAIRING");
+    cmd.args(args);
+    if let Some(id) = environment {
+        cmd.args(["--environment", id]);
+    }
+    cmd.arg("--json");
+    cmd
+}
+
+fn command(environment: Option<&str>, args: &[&str]) -> Result<serde_json::Value> {
+    let out = command_line(environment, args).output()?;
     if !out.status.success() {
         anyhow::bail!("Orca: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -122,24 +136,102 @@ fn join(terminals: Terminals, worktrees: Worktrees) -> Vec<(Agent, String)> {
         .collect()
 }
 
-pub(super) fn fetch() -> Result<Vec<(Agent, String)>> {
-    let worktrees = serde_json::from_value(command(&["worktree", "ps"])?)?;
-    let terminals = serde_json::from_value(command(&["terminal", "list"])?)?;
-    Ok(join(terminals, worktrees))
+pub(super) struct Snapshot {
+    pub agents: Vec<(Agent, String)>,
+    pub warning: Option<String>,
 }
 
-pub(super) fn focus(pane: &str) -> Result<()> {
+fn coverage_warning(results: &[&serde_json::Value]) -> Option<String> {
+    let mut omitted = std::collections::BTreeSet::new();
+    for result in results {
+        if let Some(ids) = result["hostScope"]["omittedHostIds"].as_array() {
+            for id in ids.iter().filter_map(|v| v.as_str()) {
+                omitted.insert(id.to_string());
+            }
+        }
+    }
+    (!omitted.is_empty()).then(|| {
+        format!(
+            "hosts not covered by this runtime: {} (paired servers have separate panels)",
+            omitted.into_iter().collect::<Vec<_>>().join(", ")
+        )
+    })
+}
+
+pub(super) fn fetch(environment: Option<&str>) -> Result<Snapshot> {
+    let worktrees = command(environment, &["worktree", "ps", "--limit", "10000"])?;
+    let terminals = command(environment, &["terminal", "list", "--limit", "10000"])?;
+    let warning = coverage_warning(&[&worktrees, &terminals]);
+    Ok(Snapshot {
+        agents: join(
+            serde_json::from_value(terminals)?,
+            serde_json::from_value(worktrees)?,
+        ),
+        warning,
+    })
+}
+
+pub(super) fn focus(environment: Option<&str>, pane: &str) -> Result<()> {
     let handle = pane
         .strip_prefix("orca:")
         .ok_or_else(|| anyhow::anyhow!("invalid Orca terminal ID"))?;
-    command(&["terminal", "switch", "--terminal", handle])?;
+    command(environment, &["terminal", "switch", "--terminal", handle])?;
     Ok(())
+}
+
+#[derive(Deserialize)]
+pub(super) struct Environment {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Deserialize)]
+struct Environments {
+    environments: Vec<Environment>,
+}
+
+pub(super) fn environments() -> Result<Vec<Environment>> {
+    let result: Environments = serde_json::from_value(command(None, &["environment", "list"])?)?;
+    Ok(result.environments)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn focus_routes_the_handle_to_the_selected_server() {
+        let cmd = command_line(
+            Some("server-id"),
+            &["terminal", "switch", "--terminal", "term_shared"],
+        );
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(
+            args,
+            [
+                "terminal",
+                "switch",
+                "--terminal",
+                "term_shared",
+                "--environment",
+                "server-id",
+                "--json"
+            ]
+        );
+        for name in [
+            "ORCA_ENVIRONMENT",
+            "ORCA_PAIRING_CODE",
+            "ORCA_REMOTE_PAIRING",
+        ] {
+            assert!(
+                cmd.get_envs()
+                    .any(|(key, value)| key == name && value.is_none())
+            );
+        }
+        let local = command_line(None, &["terminal", "switch", "--terminal", "term_shared"]);
+        assert!(!local.get_args().any(|a| a == "--environment"));
+    }
 
     #[test]
     fn joins_status_by_pane_key_and_keeps_detected_agents() {
@@ -185,7 +277,11 @@ mod tests {
     #[test]
     #[ignore = "requires a running Orca runtime"]
     fn live_orca_snapshot() {
-        let rows = fetch().unwrap();
+        let rows = fetch(None).unwrap().agents;
+        assert!(
+            !rows.is_empty(),
+            "live test requires at least one running Orca agent"
+        );
         for (a, _) in rows {
             assert!(a.pane_id.starts_with("orca:term_"));
             assert!(!a.agent.is_empty());

@@ -1,0 +1,40 @@
+#!/bin/sh
+# Public CLI fixtures: two runtimes deliberately issue the same terminal handle.
+if [ -n "${ORCA_ENVIRONMENT:-}${ORCA_PAIRING_CODE:-}${ORCA_REMOTE_PAIRING:-}" ]; then
+    printf '%s\n' '{"ok":false,"error":{"message":"inherited routing override"}}'
+    exit 0
+fi
+operation="$1 $2"
+shift 2
+environment=local
+terminal=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --environment) environment="$2"; shift ;;
+        --terminal) terminal="$2"; shift ;;
+    esac
+    shift
+done
+case "$operation" in
+    'environment list')
+        printf '%s\n' '{"ok":true,"result":{"environments":[{"id":"remote-id","name":"omarchy"},{"id":"offline-id","name":"offline"}]}}'
+        ;;
+    'worktree ps')
+        if [ "$environment" = offline-id ]; then
+            printf '%s\n' '{"ok":false,"error":{"message":"server offline"}}'
+        else
+            printf '{"ok":true,"result":{"worktrees":[{"worktreeId":"repo:%s","path":"/%s","displayName":"project","agents":[{"paneKey":"tab:leaf","state":"working","agentType":"codex"}]}],"hostScope":{"hostIds":["local"],"omittedHostIds":["runtime:remote-id"]}}}\n' "$environment" "$environment"
+        fi
+        ;;
+    'terminal list')
+        printf '{"ok":true,"result":{"terminals":[{"handle":"term_shared","tabId":"tab","leafId":"leaf","worktreePath":"/%s","agentIdentity":"codex"}],"hostScope":{"hostIds":["local"],"omittedHostIds":[]}}}\n' "$environment"
+        ;;
+    'terminal switch')
+        if [ "$environment" = remote-id ] && [ "$terminal" = term_shared ]; then
+            printf '%s\n' '{"ok":true,"result":{"focused":true}}'
+        else
+            printf '%s\n' '{"ok":false,"error":{"message":"focus reached the wrong server"}}'
+        fi
+        ;;
+    *) printf '%s\n' '{"ok":false,"error":{"message":"unsupported test command"}}' ;;
+esac

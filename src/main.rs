@@ -41,7 +41,7 @@ enum Source {
     Orca,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 struct Agent {
     agent: String,
     agent_status: String,
@@ -67,15 +67,18 @@ struct Snapshot {
 }
 
 enum Reply {
-    Ok(String, Vec<(Agent, String)>),
+    Ok(String, Vec<(Agent, String)>, Option<String>),
     Err(String, String),
     Msg(String),
+    OrcaEnvironments(Vec<orca::Environment>),
 }
 
 struct Panel {
     label: String,
+    /// Stable identity for updates and saved state; independent of display name.
+    key: String,
     source: Source,
-    /// `--machine` argument; `None` for the local session.
+    /// Herdr `--machine` or Orca `--environment`; `None` for local.
     machine: Option<String>,
     agents: Vec<(Agent, String)>,
     /// Pane IDs pinned to the top of this panel.
@@ -91,6 +94,7 @@ impl Panel {
     fn new(label: &str, machine: Option<&str>) -> Self {
         Self {
             label: label.into(),
+            key: label.into(),
             source: Source::Herdr,
             machine: machine.map(String::from),
             agents: vec![],
@@ -198,13 +202,15 @@ fn remote_machines() -> Vec<String> {
 fn spawn_poller(source: Source, label: String, machine: Option<String>, tx: mpsc::Sender<Reply>) {
     thread::spawn(move || {
         loop {
-            let result = match source {
-                Source::Herdr => fetch(machine.as_deref()),
-                Source::Orca => orca::fetch(),
-            };
-            let reply = match result {
-                Ok(a) => Reply::Ok(label.clone(), a),
-                Err(e) => Reply::Err(label.clone(), e.to_string()),
+            let reply = match source {
+                Source::Herdr => match fetch(machine.as_deref()) {
+                    Ok(a) => Reply::Ok(label.clone(), a, None),
+                    Err(e) => Reply::Err(label.clone(), e.to_string()),
+                },
+                Source::Orca => match orca::fetch(machine.as_deref()) {
+                    Ok(s) => Reply::Ok(label.clone(), s.agents, s.warning),
+                    Err(e) => Reply::Err(label.clone(), e.to_string()),
+                },
             };
             if tx.send(reply).is_err() {
                 return;
@@ -290,7 +296,7 @@ fn spawn_watcher(label: String, tx: mpsc::Sender<Reply>) {
                 Err(_) => None,
             };
             let reply = match result {
-                Ok(a) => Reply::Ok(label.clone(), a),
+                Ok(a) => Reply::Ok(label.clone(), a, None),
                 Err(e) => Reply::Err(label.clone(), e.to_string()),
             };
             if tx.send(reply).is_err() {
@@ -313,7 +319,7 @@ fn spawn_watcher(label: String, tx: mpsc::Sender<Reply>) {
 fn focus_command(source: Source, machine: Option<&str>, pane: &str) -> Result<()> {
     match source {
         Source::Herdr => herdr(machine, &["agent", "focus", pane]).map(|_| ()),
-        Source::Orca => orca::focus(pane),
+        Source::Orca => orca::focus(machine, pane),
     }
 }
 
@@ -418,7 +424,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         let mut lines: Vec<Line> = Vec::new();
         if let Some(e) = &p.error {
             lines.push(Line::styled(
-                format!("unreachable: {e}"),
+                format!("source: {e}"),
                 Style::default().fg(Color::Red),
             ));
         }
@@ -663,7 +669,7 @@ fn capture_state(panels: &[Panel]) -> SavedState {
             let mut pinned: Vec<String> = p.pinned.iter().cloned().collect();
             pinned.sort();
             (
-                p.label.clone(),
+                p.key.clone(),
                 PanelState {
                     height: p.height,
                     pinned,
@@ -675,7 +681,7 @@ fn capture_state(panels: &[Panel]) -> SavedState {
 
 fn restore_state(panels: &mut [Panel], saved: &SavedState) {
     for p in panels {
-        if let Some(st) = saved.get(&p.label) {
+        if let Some(st) = saved.get(&p.key) {
             p.height = st.height;
             p.pinned = st.pinned.iter().cloned().collect();
         }
@@ -684,7 +690,8 @@ fn restore_state(panels: &mut [Panel], saved: &SavedState) {
 
 /// Write the state to disk if it changed since the last write.
 fn sync_state(app: &App, saved: &mut SavedState) {
-    let now = capture_state(&app.panels);
+    let mut now = saved.clone();
+    now.extend(capture_state(&app.panels));
     if now != *saved {
         save_state(&now);
         *saved = now;
@@ -714,6 +721,19 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         panel.source = Source::Orca;
         spawn_poller(Source::Orca, panel.label.clone(), None, tx.clone());
         app.panels.push(panel);
+        let discovery_tx = tx.clone();
+        thread::spawn(move || {
+            loop {
+                let reply = match orca::environments() {
+                    Ok(environments) => Reply::OrcaEnvironments(environments),
+                    Err(e) => Reply::Msg(format!("Orca remote discovery failed: {e}")),
+                };
+                if discovery_tx.send(reply).is_err() {
+                    return;
+                }
+                thread::sleep(HEARTBEAT);
+            }
+        });
     }
     let mut saved = load_state();
     restore_state(&mut app.panels, &saved);
@@ -725,18 +745,35 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
         while let Ok(reply) = rx.try_recv() {
             dirty = true;
             match reply {
-                Reply::Ok(label, agents) => {
-                    if let Some(p) = app.panels.iter_mut().find(|p| p.label == label) {
+                Reply::Ok(label, agents, warning) => {
+                    if let Some(p) = app.panels.iter_mut().find(|p| p.key == label) {
                         p.agents = agents;
-                        p.error = None;
+                        p.error = warning;
                     }
                 }
                 Reply::Err(label, e) => {
-                    if let Some(p) = app.panels.iter_mut().find(|p| p.label == label) {
+                    if let Some(p) = app.panels.iter_mut().find(|p| p.key == label) {
                         p.error = Some(e);
                     }
                 }
                 Reply::Msg(m) => app.msg = Some((m, Instant::now())),
+                Reply::OrcaEnvironments(environments) => {
+                    for environment in environments {
+                        let panel = orca_panel(environment);
+                        if let Some(existing) = app.panels.iter_mut().find(|p| p.key == panel.key) {
+                            existing.label = panel.label;
+                        } else {
+                            spawn_poller(
+                                Source::Orca,
+                                panel.key.clone(),
+                                panel.machine.clone(),
+                                tx.clone(),
+                            );
+                            app.panels.push(panel);
+                            restore_state(&mut app.panels, &saved);
+                        }
+                    }
+                }
             }
         }
         if event::poll(Duration::from_millis(200))? {
@@ -797,6 +834,50 @@ fn run(terminal: &mut DefaultTerminal) -> Result<()> {
     }
 }
 
+fn orca_panel(environment: orca::Environment) -> Panel {
+    let mut panel = Panel::new(&format!("orca:{}", environment.name), Some(&environment.id));
+    panel.key = format!("orca:environment:{}", environment.id);
+    panel.source = Source::Orca;
+    panel
+}
+
+fn list_agents() -> Result<()> {
+    let mut panels = Vec::new();
+    if cli_available("herdr") {
+        let mut machines = vec![("local".to_string(), None)];
+        machines.extend(remote_machines().into_iter().map(|m| (m.clone(), Some(m))));
+        for (label, machine) in machines {
+            panels.push(match fetch(machine.as_deref()) {
+                Ok(agents) => serde_json::json!({"source":"herdr", "panel":label, "agents":agents}),
+                Err(e) => {
+                    serde_json::json!({"source":"herdr", "panel":label, "error":e.to_string()})
+                }
+            });
+        }
+    }
+    if cli_available("orca") {
+        let mut environments = vec![("orca:local".to_string(), None)];
+        match orca::environments() {
+            Ok(remotes) => environments.extend(
+                remotes
+                    .into_iter()
+                    .map(|e| (format!("orca:{}", e.name), Some(e.id))),
+            ),
+            Err(e) => panels.push(
+                serde_json::json!({"source":"orca", "error":format!("remote discovery: {e}")}),
+            ),
+        }
+        for (label, environment) in environments {
+            panels.push(match orca::fetch(environment.as_deref()) {
+                Ok(s) => serde_json::json!({"source":"orca", "panel":label, "environment":environment, "agents":s.agents, "warning":s.warning}),
+                Err(e) => serde_json::json!({"source":"orca", "panel":label, "environment":environment, "error":e.to_string()}),
+            });
+        }
+    }
+    println!("{}", serde_json::to_string_pretty(&panels)?);
+    Ok(())
+}
+
 fn cli_available(name: &str) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::env::var_os("PATH").is_some_and(|path| {
@@ -808,6 +889,9 @@ fn cli_available(name: &str) -> bool {
 }
 
 fn main() -> Result<()> {
+    if std::env::args().any(|a| a == "--list") {
+        return list_agents();
+    }
     let mut terminal = ratatui::init();
     execute!(stdout(), EnableMouseCapture)?;
     let res = run(&mut terminal);
@@ -835,6 +919,38 @@ mod tests {
             terminal_title_stripped: String::new(),
         };
         (a, "ws".into())
+    }
+
+    #[test]
+    fn remote_environment_ids_keep_pins_separate_across_renames() {
+        let mut one = orca_panel(orca::Environment {
+            id: "one".into(),
+            name: "server".into(),
+        });
+        let mut two = orca_panel(orca::Environment {
+            id: "two".into(),
+            name: "server".into(),
+        });
+        one.pinned.insert("orca:term_shared".into());
+        one.height = Some(12);
+        two.height = Some(8);
+        let saved = capture_state(&[one, two]);
+        let mut fresh = [
+            orca_panel(orca::Environment {
+                id: "one".into(),
+                name: "renamed".into(),
+            }),
+            orca_panel(orca::Environment {
+                id: "two".into(),
+                name: "server".into(),
+            }),
+        ];
+        restore_state(&mut fresh, &saved);
+        assert!(fresh[0].pinned.contains("orca:term_shared"));
+        assert_eq!(fresh[0].height, Some(12));
+        assert!(fresh[1].pinned.is_empty());
+        assert_eq!(fresh[1].height, Some(8));
+        assert_eq!(fresh[0].machine.as_deref(), Some("one"));
     }
 
     #[test]
